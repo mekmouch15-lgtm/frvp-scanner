@@ -1,0 +1,41 @@
+name: FRVP Scanner
+
+on:
+  schedule:
+    # Runs at minutes 1, 16, 31, 46 of every hour (a short buffer after each
+    # 15-minute candle closes, so MEXC's API has fresh data available).
+    - cron: "1,16,31,46 * * * *"
+  workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install aiohttp
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scanner.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "frvp-scanner-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Update scanner state [skip ci]"
+          git push
