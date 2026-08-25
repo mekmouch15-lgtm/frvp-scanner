@@ -4,8 +4,11 @@ Replicates the original TradingView Pine Script logic (HTF swing + Fixed Range
 Volume Profile POC retest) directly against MEXC's public REST API, then sends
 new BUY / TP / SL events to a Telegram channel via the Bot API.
 
+TP/SL messages are sent as Telegram replies to their original BUY signal
+message, so tapping them jumps back to the original trade card.
+
 Runs statelessly on each execution (e.g. every 15 minutes via GitHub Actions);
-persists a small state.json (last processed candle time per symbol) so it
+persists state.json (last processed candle + open trade per symbol) so it
 never re-sends historical signals, only genuinely new ones.
 """
 
@@ -14,10 +17,9 @@ import aiohttp
 import json
 import os
 import sys
-import time
 
 MEXC_KLINES_URL = "https://api.mexc.com/api/v3/klines"
-TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -151,7 +153,7 @@ def run_engine(candles_1h, candles_15m):
     tps = [None] * 6
     tp_done = [False] * 6
 
-    events = []  # (type, time, price)
+    events = []  # (type, time, data)
 
     for idx, c in enumerate(candles_15m):
         t = c["time"]
@@ -222,42 +224,89 @@ def run_engine(candles_1h, candles_15m):
 # Telegram
 # ============================================================================
 
-async def send_telegram(session, text):
+async def send_telegram(session, text, reply_to=None):
+    """Sends a message and returns its message_id (or None on failure)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env vars", file=sys.stderr)
-        return
-    url = TELEGRAM_API.format(token=TELEGRAM_TOKEN)
+        return None
+    url = TELEGRAM_API.format(token=TELEGRAM_TOKEN, method="sendMessage")
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+        payload["allow_sending_without_reply"] = True
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                print(f"Telegram error {resp.status}: {body}", file=sys.stderr)
+            body = await resp.json()
+            if resp.status == 200 and body.get("ok"):
+                return body["result"]["message_id"]
+            print(f"Telegram error {resp.status}: {body}", file=sys.stderr)
     except Exception as e:
         print(f"Telegram send failed: {e}", file=sys.stderr)
+    return None
 
 
-def format_event(symbol, ev_type, data):
-    if ev_type == "BUY":
-        tp = data["tp"]
-        return (
-            f"🟢 <b>{symbol}</b> — BUY (POC Retest)\n"
-            f"Entry 1: {data['entry1']:.6g}\n"
-            f"Entry 2: {data['entry2']:.6g}\n"
-            f"SL: {data['sl']:.6g}\n"
-            f"TP1: {tp[0]:.6g}  TP2: {tp[1]:.6g}  TP3: {tp[2]:.6g}\n"
-            f"TP4: {tp[3]:.6g}  TP5: {tp[4]:.6g}  TP6: {tp[5]:.6g}"
-        )
-    if ev_type == "SL":
-        return f"🔴 <b>{symbol}</b> — Stop Loss hit at {data['price']:.6g}"
-    return f"🟡 <b>{symbol}</b> — {ev_type} hit at {data['price']:.6g}"
+def pct_vs_entry(price, entry1):
+    return (price - entry1) / entry1 * 100.0
+
+
+def fmt_price(x):
+    return f"{x:.6g}"
+
+
+def fmt_pair(symbol):
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    return f"${base} | #{symbol}"
+
+
+def fmt_duration(ms):
+    total_seconds = max(0, int(ms / 1000))
+    h = total_seconds // 3600
+    m = (total_seconds % 3600) // 60
+    s = total_seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def format_buy_message(symbol, data):
+    e1, e2, sl, tp = data["entry1"], data["entry2"], data["sl"], data["tp"]
+    lines = [
+        "📈 <b>NEW TRADING SIGNAL</b> 📈",
+        "",
+        f"📊 Pair: {fmt_pair(symbol)}",
+        "",
+        "🎯 <b>ENTRIES:</b>",
+        f"🟢 Entry 1: {fmt_price(e1)}",
+        f"🟢 Entry 2: {fmt_price(e2)} [{pct_vs_entry(e2, e1):+.2f}%]",
+        "",
+        f"⛔ Stop Loss: {fmt_price(sl)} [{pct_vs_entry(sl, e1):+.2f}%]",
+        "",
+        "💎 <b>TARGETS:</b>",
+    ]
+    for i, tp_price in enumerate(tp, start=1):
+        lines.append(f"✅ TP{i}: {fmt_price(tp_price)} [{pct_vs_entry(tp_price, e1):+.2f}%]")
+    return "\n".join(lines)
+
+
+def format_hit_message(symbol, ev_type, price, entry1, entry_time_ms, hit_time_ms, trade_id):
+    gain = pct_vs_entry(price, entry1)
+    speed = fmt_duration(hit_time_ms - entry_time_ms)
+    is_sl = (ev_type == "SL")
+    header = "🛑 <b>STOP LOSS HIT</b> 🛑" if is_sl else f"✅🎉 <b>TARGET {ev_type} HIT</b> 🎉✅"
+    gain_icon = "📉" if gain < 0 else "📈"
+    lines = [
+        header,
+        f"💎 {symbol}",
+        f"{gain_icon} Gain: {gain:+.2f}%",
+        f"⏱ Speed: {speed}",
+        f"🆔 ID: {trade_id}",
+    ]
+    return "\n".join(lines)
 
 
 # ============================================================================
-# Per-symbol processing
+# Per-symbol processing (data fetch + engine only, no sending here)
 # ============================================================================
 
-async def process_symbol(session, sem, symbol, state):
+async def fetch_and_run(session, sem, symbol):
     api_symbol = symbol.replace("MEXC:", "").strip()
     if not api_symbol:
         return None
@@ -270,16 +319,22 @@ async def process_symbol(session, sem, symbol, state):
     candles_15m = parse_klines(raw_15m)
 
     if len(candles_1h) < (SWING_LEFT + SWING_RIGHT + 5) or len(candles_15m) < 20:
-        return None  # not enough data / symbol not on MEXC as expected
+        return None
 
     events = run_engine(candles_1h, candles_15m)
     last_candle_time = candles_15m[-1]["time"]
+    return api_symbol, events, last_candle_time
 
-    prev_time = state.get(api_symbol, 0)
-    new_events = [e for e in events if e[1] > prev_time] if prev_time else []
 
-    state[api_symbol] = last_candle_time
-    return api_symbol, new_events
+# ============================================================================
+# State helpers
+# ============================================================================
+
+def normalize_symbol_state(raw):
+    """Old state format was symbol -> int(last_time). Upgrade to dict form."""
+    if isinstance(raw, dict):
+        return raw
+    return {"last_time": raw or 0, "open": None}
 
 
 # ============================================================================
@@ -302,30 +357,61 @@ async def main():
             except json.JSONDecodeError:
                 state = {}
 
+    counter = state.get("_counter", 10000)
+
     sem = asyncio.Semaphore(CONCURRENCY)
     connector = aiohttp.TCPConnector(limit=CONCURRENCY * 2)
 
+    total_alerts = 0
+
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [process_symbol(session, sem, s, state) for s in symbols]
+        tasks = [fetch_and_run(session, sem, s) for s in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        alerts_to_send = []
         for r in results:
             if isinstance(r, Exception) or r is None:
                 continue
-            api_symbol, new_events = r
+            api_symbol, events, last_candle_time = r
+
+            sym_state = normalize_symbol_state(state.get(api_symbol))
+            prev_time = sym_state.get("last_time", 0)
+            open_trade = sym_state.get("open")
+
+            new_events = [e for e in events if e[1] > prev_time] if prev_time else []
+
             for ev_type, t, data in new_events:
-                alerts_to_send.append((api_symbol, ev_type, t, data))
+                if ev_type == "BUY":
+                    text = format_buy_message(api_symbol, data)
+                    msg_id = await send_telegram(session, text)
+                    counter += 1
+                    open_trade = {
+                        "message_id": msg_id,
+                        "entry_time": t,
+                        "entry1": data["entry1"],
+                        "trade_id": counter,
+                    }
+                    total_alerts += 1
+                else:
+                    entry1 = open_trade["entry1"] if open_trade else data["price"]
+                    entry_time = open_trade["entry_time"] if open_trade else t
+                    trade_id = open_trade["trade_id"] if open_trade else counter
+                    reply_to = open_trade["message_id"] if open_trade else None
 
-        alerts_to_send.sort(key=lambda x: x[2])
+                    text = format_hit_message(api_symbol, ev_type, data["price"],
+                                               entry1, entry_time, t, trade_id)
+                    await send_telegram(session, text, reply_to=reply_to)
+                    total_alerts += 1
 
-        print(f"Processed {len(symbols)} symbols, {len(alerts_to_send)} new alerts")
+                    if ev_type in ("SL", "TP6"):
+                        open_trade = None
 
-        for api_symbol, ev_type, t, data in alerts_to_send:
-            text = format_event(api_symbol, ev_type, data)
-            await send_telegram(session, text)
-            await asyncio.sleep(0.3)  # gentle on Telegram's rate limit
+                await asyncio.sleep(0.3)  # gentle on Telegram's rate limit
 
+            state[api_symbol] = {"last_time": last_candle_time, "open": open_trade}
+
+        print(f"Processed {len(symbols)} symbols, {total_alerts} new alerts")
+
+    state["_counter"] = counter
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
