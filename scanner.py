@@ -402,15 +402,24 @@ async def main():
                     }
                     total_alerts += 1
                 else:
-                    entry1 = open_trade["entry1"] if open_trade else data["price"]
-                    entry_time = open_trade["entry_time"] if open_trade else t
-                    trade_id = open_trade["trade_id"] if open_trade else counter
-                    reply_to = open_trade["message_id"] if open_trade else None
+                    if open_trade is None:
+                        # This TP/SL belongs to a trade that was already open
+                        # before per-trade tracking (entry price/time/message
+                        # id) was introduced. We have no real data to report,
+                        # so skip it rather than posting a fake 0%/00:00:00
+                        # message. Once this legacy trade closes, every trade
+                        # after it will be tracked correctly from its BUY on.
+                        pass
+                    else:
+                        entry1 = open_trade["entry1"]
+                        entry_time = open_trade["entry_time"]
+                        trade_id = open_trade["trade_id"]
+                        reply_to = open_trade["message_id"]
 
-                    text = format_hit_message(api_symbol, ev_type, data["price"],
-                                               entry1, entry_time, t, trade_id)
-                    await send_telegram(session, text, reply_to=reply_to)
-                    total_alerts += 1
+                        text = format_hit_message(api_symbol, ev_type, data["price"],
+                                                   entry1, entry_time, t, trade_id)
+                        await send_telegram(session, text, reply_to=reply_to)
+                        total_alerts += 1
 
                     if ev_type in ("SL", "TP6"):
                         open_trade = None
