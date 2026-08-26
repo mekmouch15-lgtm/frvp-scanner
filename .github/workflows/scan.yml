@@ -2,11 +2,11 @@ name: FRVP Scanner
 
 on:
   schedule:
-    # Runs every minute. Trades themselves still only form on closed 15m
-    # candles (the strategy logic is unchanged) - running every minute just
-    # means a newly-closed candle is noticed and posted within ~60 seconds
-    # instead of waiting up to 15 minutes for the next scheduled scan.
-    - cron: "* * * * *"
+    # Every minute is documented by GitHub as unreliable and can be silently
+    # skipped for long stretches during high load. Every 5 minutes is well
+    # within GitHub's supported range and runs reliably - still 3x faster
+    # than the original 15-minute interval.
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
 
 # Prevents overlapping runs from racing on state.json: if a run is still
