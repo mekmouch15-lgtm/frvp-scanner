@@ -42,7 +42,9 @@ KLINES_15M_LIMIT = 1000          # ~10 days of 15m candles, for profile + entrie
 STATE_FILE = "state.json"
 SYMBOLS_FILE = "symbols.txt"
 
-CONCURRENCY = 12                 # simultaneous requests to MEXC
+CONCURRENCY = 25                 # simultaneous requests to MEXC (raised so a
+                                  # full 564-symbol run comfortably finishes
+                                  # well under the 1-minute schedule interval)
 
 
 # ============================================================================
@@ -317,6 +319,14 @@ async def fetch_and_run(session, sem, symbol):
     )
     candles_1h = parse_klines(raw_1h)
     candles_15m = parse_klines(raw_15m)
+
+    # MEXC's klines endpoint returns the still-forming (unclosed) candle as
+    # the last row. Using it would let a trade's entry and its TP/SL checks
+    # both fall inside that same wide, incomplete candle - producing
+    # impossible-looking "instant" TP cascades. Drop it, mirroring the
+    # original Pine script's barstate.isconfirmed guard (closed bars only).
+    candles_1h = candles_1h[:-1] if len(candles_1h) > 1 else candles_1h
+    candles_15m = candles_15m[:-1] if len(candles_15m) > 1 else candles_15m
 
     if len(candles_1h) < (SWING_LEFT + SWING_RIGHT + 5) or len(candles_15m) < 20:
         return None
