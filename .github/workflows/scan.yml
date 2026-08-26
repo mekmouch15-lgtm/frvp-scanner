@@ -2,10 +2,19 @@ name: FRVP Scanner
 
 on:
   schedule:
-    # Runs at minutes 1, 16, 31, 46 of every hour (a short buffer after each
-    # 15-minute candle closes, so MEXC's API has fresh data available).
-    - cron: "1,16,31,46 * * * *"
+    # Runs every minute. Trades themselves still only form on closed 15m
+    # candles (the strategy logic is unchanged) - running every minute just
+    # means a newly-closed candle is noticed and posted within ~60 seconds
+    # instead of waiting up to 15 minutes for the next scheduled scan.
+    - cron: "* * * * *"
   workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
+
+# Prevents overlapping runs from racing on state.json: if a run is still
+# going when the next minute ticks, the new one waits in queue instead of
+# running in parallel and corrupting the committed state.
+concurrency:
+  group: frvp-scanner
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -13,7 +22,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
