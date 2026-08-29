@@ -1,13 +1,11 @@
 name: FRVP Scanner
 
 on:
-  schedule:
-    # Every minute is documented by GitHub as unreliable and can be silently
-    # skipped for long stretches during high load. Every 5 minutes is well
-    # within GitHub's supported range and runs reliably - still 3x faster
-    # than the original 15-minute interval.
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
+  # No internal GitHub schedule here on purpose - an external cron-job.org
+  # job calls workflow_dispatch on a reliable interval instead. Having both
+  # a GitHub schedule AND an external trigger running side by side is what
+  # was causing the same trade to be posted twice from two independent runs.
+  workflow_dispatch: {}
 
 # Prevents overlapping runs from racing on state.json: if a run is still
 # going when the next minute ticks, the new one waits in queue instead of
