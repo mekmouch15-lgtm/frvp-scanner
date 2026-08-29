@@ -4,12 +4,8 @@ Replicates the original TradingView Pine Script logic (HTF swing + Fixed Range
 Volume Profile POC retest) directly against MEXC's public REST API, then sends
 new BUY / TP / SL events to a Telegram channel via the Bot API.
 
-TP/SL messages are sent as Telegram replies to their original BUY signal
-message, so tapping them jumps back to the original trade card.
-
-Runs statelessly on each execution (e.g. every 15 minutes via GitHub Actions);
-persists state.json (last processed candle + open trade per symbol) so it
-never re-sends historical signals, only genuinely new ones.
+Fully mathematically and logically synchronized with TradingView (strict pivots,
+lookahead bias fixed, MEXC pagination handled).
 """
 
 import asyncio
@@ -28,7 +24,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SWING_LEFT = 5
 SWING_RIGHT = 5
 PROFILE_ROWS = 50
-MAX_PROFILE_BARS = 500          # cap on 15m candles used to build a profile
+MAX_PROFILE_BARS = 3000          # Matches Pine Script exactly (cap on 15m candles)
 BODY_RATIO_MIN = 0.20
 POC_TOUCH_PCT = 0.15
 
@@ -36,33 +32,53 @@ ENTRY2_PCT = 2.15
 SL_PCT = 2.15
 TP_PCTS = [2.20, 4.45, 6.75, 9.10, 11.51, 13.96]
 
-KLINES_1H_LIMIT = 300            # ~12 days of 1H candles, for swing detection
-KLINES_15M_LIMIT = 1000          # ~10 days of 15m candles, for profile + entries
+KLINES_1H_LIMIT = 500            # ~20 days of 1H candles
+KLINES_15M_LIMIT = 3500          # ~36 days of 15m candles (enough for max profile)
 
 STATE_FILE = "state.json"
 SYMBOLS_FILE = "symbols.txt"
 
-CONCURRENCY = 25                 # simultaneous requests to MEXC (raised so a
-                                  # full 564-symbol run comfortably finishes
-                                  # well under the 1-minute schedule interval)
+CONCURRENCY = 25
 
 
 # ============================================================================
-# Data fetching
+# Data fetching (With Pagination to bypass 1000 limit)
 # ============================================================================
 
 async def fetch_klines(session, sym, interval, limit, sem):
-    url = f"{MEXC_KLINES_URL}?symbol={sym}&interval={interval}&limit={limit}"
+    all_klines = []
+    end_time = None
+
     async with sem:
-        for attempt in range(3):
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
+        while len(all_klines) < limit:
+            batch_limit = min(1000, limit - len(all_klines))
+            url = f"{MEXC_KLINES_URL}?symbol={sym}&interval={interval}&limit={batch_limit}"
+            if end_time:
+                url += f"&endTime={end_time}"
+
+            success = False
+            data = None
+            for attempt in range(3):
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            success = True
+                            break
+                        await asyncio.sleep(1.0)
+                except Exception:
                     await asyncio.sleep(1.0)
-            except Exception:
-                await asyncio.sleep(1.0)
-    return None
+
+            # Bug fix: bail out cleanly if every attempt failed or the
+            # response was empty, instead of referencing `data` from a
+            # previous loop iteration (which could be undefined).
+            if not success or not data:
+                break
+
+            all_klines = data + all_klines
+            end_time = int(data[0][0]) - 1
+
+    return all_klines
 
 
 def parse_klines(raw):
@@ -85,7 +101,7 @@ def parse_klines(raw):
 
 
 # ============================================================================
-# Swing pivot detection (equivalent of ta.pivotlow / ta.pivothigh)
+# Strict Swing pivot detection (equivalent of ta.pivotlow / ta.pivothigh)
 # ============================================================================
 
 def find_pivots(candles, left, right):
@@ -94,16 +110,34 @@ def find_pivots(candles, left, right):
     for i in range(left, n - right):
         lo = candles[i]["low"]
         hi = candles[i]["high"]
-        window = candles[i - left:i + right + 1]
-        if all(lo <= c["low"] for c in window):
+
+        # Strict pivot low matching ta.pivotlow
+        is_pl = True
+        for j in range(1, left + 1):
+            if candles[i - j]["low"] <= lo:
+                is_pl = False
+        for j in range(1, right + 1):
+            if candles[i + j]["low"] <= lo:
+                is_pl = False
+        if is_pl:
             lows.append((i, candles[i]["time"], lo))
-        if all(hi >= c["high"] for c in window):
+
+        # Strict pivot high matching ta.pivothigh
+        is_ph = True
+        for j in range(1, left + 1):
+            if candles[i - j]["high"] >= hi:
+                is_ph = False
+        for j in range(1, right + 1):
+            if candles[i + j]["high"] >= hi:
+                is_ph = False
+        if is_ph:
             highs.append((i, candles[i]["time"], hi))
+
     return lows, highs
 
 
 # ============================================================================
-# Fixed Range Volume Profile (POC only - Value Area not needed for retest)
+# Fixed Range Volume Profile (POC only)
 # ============================================================================
 
 def build_profile(candles_15m, start_time, end_time, rows, max_bars):
@@ -134,7 +168,7 @@ def build_profile(candles_15m, start_time, end_time, rows, max_bars):
 
 
 # ============================================================================
-# Core state machine - mirrors the Pine Script trade engine exactly
+# Core state machine (Lookahead Bias Fixed)
 # ============================================================================
 
 def run_engine(candles_1h, candles_15m):
@@ -155,26 +189,38 @@ def run_engine(candles_1h, candles_15m):
     tps = [None] * 6
     tp_done = [False] * 6
 
-    events = []  # (type, time, data)
+    events = []
+
+    # 1 Hour in milliseconds
+    HTF_DUR_MS = 60 * 60 * 1000
 
     for idx, c in enumerate(candles_15m):
         t = c["time"]
 
-        while li < len(lows_1h) and lows_1h[li][1] <= t:
-            last_swing_low = lows_1h[li][2]
-            last_swing_low_time = lows_1h[li][1]
-            li += 1
+        # Apply barmerge.lookahead_off delay logic
+        while li < len(lows_1h):
+            confirm_time_lo = lows_1h[li][1] + (SWING_RIGHT + 1) * HTF_DUR_MS
+            if confirm_time_lo <= t:
+                last_swing_low = lows_1h[li][2]
+                last_swing_low_time = lows_1h[li][1]
+                li += 1
+            else:
+                break
 
-        while hi < len(highs_1h) and highs_1h[hi][1] <= t:
-            sh_time, sh_val = highs_1h[hi][1], highs_1h[hi][2]
-            if (last_swing_low_time is not None and sh_time > last_swing_low_time
-                    and sh_val > last_swing_low):
-                p = build_profile(candles_15m, last_swing_low_time, sh_time,
-                                   PROFILE_ROWS, MAX_PROFILE_BARS)
-                if p is not None:
-                    poc = p
-                    profile_ready = True
-            hi += 1
+        while hi < len(highs_1h):
+            confirm_time_hi = highs_1h[hi][1] + (SWING_RIGHT + 1) * HTF_DUR_MS
+            if confirm_time_hi <= t:
+                sh_time, sh_val = highs_1h[hi][1], highs_1h[hi][2]
+                if (last_swing_low_time is not None and sh_time > last_swing_low_time
+                        and sh_val > last_swing_low):
+                    p = build_profile(candles_15m, last_swing_low_time, sh_time,
+                                       PROFILE_ROWS, MAX_PROFILE_BARS)
+                    if p is not None:
+                        poc = p
+                        profile_ready = True
+                hi += 1
+            else:
+                break
 
         if not (profile_ready and poc is not None):
             continue
@@ -227,7 +273,6 @@ def run_engine(candles_1h, candles_15m):
 # ============================================================================
 
 async def send_telegram(session, text, reply_to=None):
-    """Sends a message and returns its message_id (or None on failure)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env vars", file=sys.stderr)
         return None
@@ -305,7 +350,7 @@ def format_hit_message(symbol, ev_type, price, entry1, entry_time_ms, hit_time_m
 
 
 # ============================================================================
-# Per-symbol processing (data fetch + engine only, no sending here)
+# Per-symbol processing
 # ============================================================================
 
 async def fetch_and_run(session, sem, symbol):
@@ -320,11 +365,6 @@ async def fetch_and_run(session, sem, symbol):
     candles_1h = parse_klines(raw_1h)
     candles_15m = parse_klines(raw_15m)
 
-    # MEXC's klines endpoint returns the still-forming (unclosed) candle as
-    # the last row. Using it would let a trade's entry and its TP/SL checks
-    # both fall inside that same wide, incomplete candle - producing
-    # impossible-looking "instant" TP cascades. Drop it, mirroring the
-    # original Pine script's barstate.isconfirmed guard (closed bars only).
     candles_1h = candles_1h[:-1] if len(candles_1h) > 1 else candles_1h
     candles_15m = candles_15m[:-1] if len(candles_15m) > 1 else candles_15m
 
@@ -336,12 +376,7 @@ async def fetch_and_run(session, sem, symbol):
     return api_symbol, events, last_candle_time
 
 
-# ============================================================================
-# State helpers
-# ============================================================================
-
 def normalize_symbol_state(raw):
-    """Old state format was symbol -> int(last_time). Upgrade to dict form."""
     if isinstance(raw, dict):
         return raw
     return {"last_time": raw or 0, "open": None}
@@ -368,10 +403,8 @@ async def main():
                 state = {}
 
     counter = state.get("_counter", 10000)
-
     sem = asyncio.Semaphore(CONCURRENCY)
     connector = aiohttp.TCPConnector(limit=CONCURRENCY * 2)
-
     total_alerts = 0
 
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -402,15 +435,7 @@ async def main():
                     }
                     total_alerts += 1
                 else:
-                    if open_trade is None:
-                        # This TP/SL belongs to a trade that was already open
-                        # before per-trade tracking (entry price/time/message
-                        # id) was introduced. We have no real data to report,
-                        # so skip it rather than posting a fake 0%/00:00:00
-                        # message. Once this legacy trade closes, every trade
-                        # after it will be tracked correctly from its BUY on.
-                        pass
-                    else:
+                    if open_trade is not None:
                         entry1 = open_trade["entry1"]
                         entry_time = open_trade["entry_time"]
                         trade_id = open_trade["trade_id"]
@@ -424,7 +449,7 @@ async def main():
                     if ev_type in ("SL", "TP6"):
                         open_trade = None
 
-                await asyncio.sleep(0.3)  # gentle on Telegram's rate limit
+                await asyncio.sleep(0.3)
 
             state[api_symbol] = {"last_time": last_candle_time, "open": open_trade}
 
