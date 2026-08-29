@@ -46,5 +46,22 @@ jobs:
           git config user.name "frvp-scanner-bot"
           git config user.email "actions@github.com"
           git add state.json
-          git diff --staged --quiet || git commit -m "Update scanner state [skip ci]"
-          git push
+          git diff --staged --quiet && exit 0
+          git commit -m "Update scanner state [skip ci]"
+
+          # Retry push with rebase: if another run's commit landed on the
+          # remote in the meantime, pull it in and retry instead of failing
+          # silently - a silent push failure is what causes the next run to
+          # start from stale state and re-send an already-posted trade.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Push succeeded on attempt $attempt"
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt), pulling and retrying..."
+            git pull --rebase origin main
+            sleep 2
+          done
+
+          echo "::error::Failed to push state.json after 5 attempts"
+          exit 1
