@@ -26,6 +26,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history, required for pull --rebase to work
+                            # reliably in the "Commit updated state" step below
 
       - name: Set up Python
         uses: actions/setup-python@v5
